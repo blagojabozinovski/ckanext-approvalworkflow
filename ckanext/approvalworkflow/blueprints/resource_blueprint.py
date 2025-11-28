@@ -1,25 +1,12 @@
 # Resource related blueprint
-# Overriding Resource functions
-import flask
-import six
-import cgi
-import logging
-
+# Overriding Resource functions to add approval workflow functionality
 from flask import Blueprint
-from flask.views import MethodView
-
-from ckan.common import _, g, request
-from ckan.plugins import toolkit
-from ckan.lib import mailer
-
+from ckan.common import g, request
+from ckanext.approvalworkflow import helpers
 import ckan.lib.helpers as h
 import ckan.logic as logic
-import ckan.lib.base as base
 import ckan.lib.navl.dictization_functions as dict_fns
 import ckan.model as model
-import ckan.plugins as plugins
-
-import ckanext.approvalworkflow.db as db
 import ckan.views.resource as resource
 
 clean_dict = logic.clean_dict
@@ -37,6 +24,7 @@ approval_resource_blueprint = Blueprint(
     url_defaults={u'package_type': u'dataset'}
 )
 
+
 class CreateView(resource.CreateView):
     def post(self, package_type, id):
         save_action = request.form.get(u'save')
@@ -47,7 +35,6 @@ class CreateView(resource.CreateView):
             dict_fns.unflatten(tuplize_dict(parse_params(request.files)))
         ))
         del data[u'save']
-        resource_id = data.pop(u'id')
 
         context = {
             u'model': model,
@@ -56,14 +43,6 @@ class CreateView(resource.CreateView):
             u'auth_user_obj': g.userobj
         }
 
-        data_provided = False
-        for key, value in six.iteritems(data):
-            if (
-                    (value or isinstance(value, cgi.FieldStorage))
-                    and key != u'resource_type'):
-                data_provided = True
-                break
-        
         if save_action == u'review':
             # XXX race condition if another user edits/deletes
             data_dict = get_action(u'package_show')(context, {u'id': id})
@@ -71,15 +50,24 @@ class CreateView(resource.CreateView):
                 dict(context, allow_state_change=True),
                 dict(data_dict, state=u'pending')
             )
+
+            approval_data = {
+                'package_id': data_dict['id'],
+                'approval-notes': 'Dataset sent for approval',
+                'submitted_action': 'pending',
+            }
+            get_action(u'approval_activity_create')(context, approval_data)
+
             import ckanext.approvalworkflow.email as email
-            user = get_sysadmins()
 
             org = get_action(u'organization_show')(context, {u'id': data_dict['owner_org']})
-            for user in user:
+
+            admins = helpers.get_org_admins_raw(org['id'])
+            for user in admins:
                 if user.email:
                     email.send_approval_needed(user, org, data_dict)
-            return h.redirect_to(u'{}.read'.format(package_type), id=id)         
-   
+            return h.redirect_to(u'{}.read'.format(package_type), id=id)
+
         else:
             return super(CreateView, self).post(package_type, id)
 
@@ -88,11 +76,13 @@ class CreateView(resource.CreateView):
 
 
 def get_sysadmins():
-    q = model.Session.query(model.User).filter(model.User.sysadmin == True,
+    q = model.Session.query(model.User).filter(model.User.sysadmin is True,
                                                model.User.state == 'active')
     return q.all()
 
+
 def register_dataset_plugin_rules(blueprint):
     blueprint.add_url_rule(u'/new', view_func=CreateView.as_view(str(u'new')))
+
 
 register_dataset_plugin_rules(approval_resource_blueprint)
